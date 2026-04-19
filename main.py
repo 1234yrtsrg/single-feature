@@ -13,6 +13,7 @@ from sklearn.exceptions import ConvergenceWarning
 from config import Config
 from pipeline.orchestrator import NestedCVOrchestrator
 from pipeline.reporter import ResultReporter
+from utils.logger import Logger
 
 os.environ["PYTHONWARNINGS"] = "ignore"
 
@@ -48,6 +49,14 @@ def split_contiguous(values, n_chunks):
 
 def apply_runtime_config(args):
     Config.N_JOBS = int(args.n_jobs)
+
+
+def build_log_name(args):
+    if args.worker_max_features:
+        return f"worker_{args.metal.lower()}"
+    if args.sweep_shared_max_features:
+        return f"sweep_controller_{args.metal.lower()}"
+    return f"single_{args.metal.lower()}_k{int(args.shared_max_features)}"
 
 
 def build_single_output_path(current_dir, metal, shared_max_features):
@@ -96,12 +105,15 @@ def run_single_job(current_dir, data_path, args, shared_max_features=None, expor
     target_metal = METAL_COLUMN_MAP[args.metal]
     output_path = build_single_output_path(current_dir, args.metal, shared_max_features) if export_outputs else None
 
-    print(f"[*] Data Source: {data_path}")
+    Logger.console(
+        f"[TRAIN] START metal={args.metal} shared_max_features={shared_max_features}"
+    )
+    Logger.log(f"[*] Data Source: {data_path}")
     if output_path:
-        print(f"[*] Output Target: {output_path}")
-    print(f"[*] Predict Metal: {args.metal} -> {target_metal}")
-    print(f"[*] SHARED_MAX_FEATURES: {shared_max_features}")
-    print(f"[*] N_JOBS: {Config.N_JOBS}")
+        Logger.log(f"[*] Output Target: {output_path}")
+    Logger.log(f"[*] Predict Metal: {args.metal} -> {target_metal}")
+    Logger.log(f"[*] SHARED_MAX_FEATURES: {shared_max_features}")
+    Logger.log(f"[*] N_JOBS: {Config.N_JOBS}")
 
     runner = NestedCVOrchestrator(
         data_path=data_path,
@@ -110,7 +122,11 @@ def run_single_job(current_dir, data_path, args, shared_max_features=None, expor
         max_features=shared_max_features,
         export_outputs=export_outputs
     )
-    return runner.run()
+    result = runner.run()
+    Logger.console(
+        f"[TRAIN] DONE  metal={args.metal} shared_max_features={shared_max_features}"
+    )
+    return result
 
 
 def run_worker_jobs(current_dir, data_path, args):
@@ -122,7 +138,7 @@ def run_worker_jobs(current_dir, data_path, args):
     feature_values = parse_int_csv(args.worker_max_features)
 
     for idx, shared_max_features in enumerate(feature_values, start=1):
-        print(
+        Logger.log(
             f"[*] Worker GPU visible set={os.environ.get('CUDA_VISIBLE_DEVICES', 'CPU')} "
             f"| task {idx}/{len(feature_values)} | SHARED_MAX_FEATURES={shared_max_features}"
         )
@@ -185,7 +201,7 @@ def run_sweep_jobs(current_dir, data_path, args):
             env.setdefault("MKL_NUM_THREADS", "1")
             env.setdefault("NUMEXPR_NUM_THREADS", "1")
 
-            print(f"[*] Launch worker {worker_id}: GPU {gpu_id} -> features {chunk[0]}..{chunk[-1]}")
+            Logger.log(f"[*] Launch worker {worker_id}: GPU {gpu_id} -> features {chunk[0]}..{chunk[-1]}")
             proc = subprocess.Popen(cmd, cwd=current_dir, env=env)
             worker_jobs.append((gpu_id, chunk, summary_xlsx, proc))
 
@@ -278,7 +294,12 @@ if __name__ == "__main__":
     apply_runtime_config(args)
 
     current_dir = os.path.dirname(os.path.abspath(__file__))
+    Logger.init(
+        log_dir=os.path.join(current_dir, "logs"),
+        log_name=build_log_name(args)
+    )
     data_path = os.path.abspath(os.path.join(current_dir, "data/Raman_spectroscopy_data_preprocessed.csv"))
+    Logger.log(f"[*] Log File: {Logger.log_path()}")
 
     if args.worker_max_features:
         run_worker_jobs(current_dir, data_path, args)
