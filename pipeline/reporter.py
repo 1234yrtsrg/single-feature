@@ -20,8 +20,55 @@ class ResultReporter:
         return selected_waves, selected_waves_float
 
     @staticmethod
-    def build_summary_table(fold_metrics_df):
-        mean_metrics = fold_metrics_df.groupby(['Target', 'Model', 'Set'])[['R2', 'RMSE', 'RPD']].mean().reset_index()
+    def build_summary_table(
+        fold_metrics_df,
+        Y_true_matrix=None,
+        target_metals=None,
+        oof_predictions_by_model=None
+    ):
+        train_metrics = (
+            fold_metrics_df[fold_metrics_df["Set"] == "Train"]
+            .groupby(['Target', 'Model', 'Set'])[['R2', 'RMSE', 'RPD']]
+            .mean()
+            .reset_index()
+        )
+
+        if (
+            Y_true_matrix is not None and
+            target_metals is not None and
+            oof_predictions_by_model is not None
+        ):
+            oof_records = []
+            Y_true_matrix = np.asarray(Y_true_matrix, dtype=float)
+            for j, metal in enumerate(target_metals):
+                y_true = Y_true_matrix[:, j]
+                for model, y_pred in oof_predictions_by_model.get(metal, {}).items():
+                    y_pred = np.asarray(y_pred, dtype=float)
+                    valid_mask = np.isfinite(y_true) & np.isfinite(y_pred)
+                    if not np.any(valid_mask):
+                        continue
+                    r2, rmse, rpd = MetricsUtil.compute_metrics(
+                        y_true[valid_mask],
+                        y_pred[valid_mask]
+                    )
+                    oof_records.append({
+                        "Target": metal,
+                        "Model": model,
+                        "Set": "Test",
+                        "R2": r2,
+                        "RMSE": rmse,
+                        "RPD": rpd,
+                    })
+            test_metrics = pd.DataFrame(oof_records)
+        else:
+            test_metrics = (
+                fold_metrics_df[fold_metrics_df["Set"] == "Test"]
+                .groupby(['Target', 'Model', 'Set'])[['R2', 'RMSE', 'RPD']]
+                .mean()
+                .reset_index()
+            )
+
+        mean_metrics = pd.concat([train_metrics, test_metrics], ignore_index=True)
 
         pivot_df = mean_metrics.pivot(index=['Target', 'Model'], columns='Set', values=['R2', 'RMSE', 'RPD'])
 
@@ -78,7 +125,17 @@ class ResultReporter:
         Logger.log(f"[SAVE] Sweep summary saved to: {output_path}")
 
     @staticmethod
-    def export_oof_predictions_to_excel(output_path, sample_ids, outer_fold_ids, target_metals, Y_true_matrix, oof_pred_global_dict, oof_pred_moe_dict, fold_metrics_df):
+    def export_oof_predictions_to_excel(
+        output_path,
+        sample_ids,
+        outer_fold_ids,
+        target_metals,
+        Y_true_matrix,
+        oof_pred_global_dict,
+        oof_pred_moe_dict,
+        fold_metrics_df,
+        oof_predictions_by_model=None
+    ):
         sample_ids = np.asarray(sample_ids)
         outer_fold_ids = np.asarray(outer_fold_ids)
 
@@ -95,7 +152,12 @@ class ResultReporter:
             df_m[f"{metal}_true"] = y_true
             df_m[f"{metal}_pred"] = pred_m
 
-        df_summary = ResultReporter.build_summary_table(fold_metrics_df)
+        df_summary = ResultReporter.build_summary_table(
+            fold_metrics_df,
+            Y_true_matrix=Y_true_matrix,
+            target_metals=target_metals,
+            oof_predictions_by_model=oof_predictions_by_model
+        )
 
         with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
             df_g.to_excel(writer, sheet_name="GlobalStack_Predictions", index=False)

@@ -71,11 +71,33 @@ def build_sweep_output_path(current_dir, metal):
 
 
 def collect_target_metrics(result, target_metal, summary_model, shared_max_features):
-    row = ResultReporter.extract_train_test_metrics(
-        result["fold_metrics"],
-        target=target_metal,
-        model=summary_model
-    )
+    summary_df = result.get("summary")
+    row = None
+    if summary_df is not None:
+        subset = summary_df[
+            (summary_df["Target"] == target_metal) &
+            (summary_df["Model"] == summary_model)
+        ]
+        if not subset.empty:
+            rec = subset.iloc[0]
+            row = {
+                "Target": target_metal,
+                "Model": summary_model,
+                "Train R2": rec.get("Train R2"),
+                "Train RMSE": rec.get("Train RMSE"),
+                "Train RPD": rec.get("Train RPD"),
+                "Test R2": rec.get("OOF R2"),
+                "Test RMSE": rec.get("OOF RMSE"),
+                "Test RPD": rec.get("OOF RPD"),
+            }
+
+    if row is None:
+        row = ResultReporter.extract_train_test_metrics(
+            result["fold_metrics"],
+            target=target_metal,
+            model=summary_model
+        )
+
     return {
         "SHARED_MAX_FEATURES": int(shared_max_features),
         "Metal": target_metal,

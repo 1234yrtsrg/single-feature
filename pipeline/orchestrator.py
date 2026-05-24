@@ -82,6 +82,13 @@ class NestedCVOrchestrator:
 
         oof_pred_global = {m: np.full(n_samples, np.nan) for m in self.target_metals}
         oof_pred_moe = {m: np.full(n_samples, np.nan) for m in self.target_metals}
+        oof_pred_by_model = {
+            m: {
+                model: np.full(n_samples, np.nan)
+                for model in ["PLS", "KRR", "ElasticNet", "RFRR", "RSRidge", "GlobalStack", "MoE"]
+            }
+            for m in self.target_metals
+        }
         outer_fold_ids = np.full(n_samples, -1, dtype=int)
 
         for outer_id, (tr_idx, te_idx) in enumerate(outer_cv.split(X_full, Y), start=1):
@@ -215,28 +222,32 @@ class NestedCVOrchestrator:
                 base_models["RSRidge"] = best_rsr
 
                 # Base model metrics
-                Z_tr_oof, Z_te = [], []
+                Z_tr_oof, Z_tr_self, Z_te = [], [], []
                 for name, est in base_models.items():
                     pred_oof = ModelTrainer.cross_val_predict_safe(
                         est, X_tr_global, y_tr, cv=inner_meta_cv
                     )
-                    r2_tr, rmse_tr, rpd_tr = MetricsUtil.compute_metrics(y_tr, pred_oof)
+                    est_full = clone(est).fit(X_tr_global, y_tr)
+                    pred_tr_self = MetricsUtil.ravel_pred(est_full.predict(X_tr_global))
+                    r2_tr, rmse_tr, rpd_tr = MetricsUtil.compute_metrics(y_tr, pred_tr_self)
                     fold_perf_records.append({
                         "Fold": outer_id, "Target": metal, "Model": name,
                         "Set": "Train", "R2": r2_tr, "RMSE": rmse_tr, "RPD": rpd_tr
                     })
                     Z_tr_oof.append(pred_oof)
+                    Z_tr_self.append(pred_tr_self)
 
-                    est_full = clone(est).fit(X_tr_global, y_tr)
                     pred_te = MetricsUtil.ravel_pred(est_full.predict(X_te_global))
                     r2_te, rmse_te, rpd_te = MetricsUtil.compute_metrics(y_te, pred_te)
                     fold_perf_records.append({
                         "Fold": outer_id, "Target": metal, "Model": name,
                         "Set": "Test", "R2": r2_te, "RMSE": rmse_te, "RPD": rpd_te
                     })
+                    oof_pred_by_model[metal][name][te_idx] = pred_te
                     Z_te.append(pred_te)
 
                 Z_tr_oof = np.column_stack(Z_tr_oof)
+                Z_tr_self = np.column_stack(Z_tr_self)
                 Z_te = np.column_stack(Z_te)
 
                 # Global Stacking
@@ -244,13 +255,14 @@ class NestedCVOrchestrator:
                 y_tr_stack_oof = ModelTrainer.cross_val_predict_safe(
                     meta_global, Z_tr_oof, y_tr, cv=inner_meta_cv
                 )
-                r2_tr_s, rmse_tr_s, rpd_tr_s = MetricsUtil.compute_metrics(y_tr, y_tr_stack_oof)
+
+                meta_global.fit(Z_tr_oof, y_tr)
+                y_tr_stack_self = MetricsUtil.ravel_pred(meta_global.predict(Z_tr_self))
+                r2_tr_s, rmse_tr_s, rpd_tr_s = MetricsUtil.compute_metrics(y_tr, y_tr_stack_self)
                 fold_perf_records.append({
                     "Fold": outer_id, "Target": metal, "Model": "GlobalStack",
                     "Set": "Train", "R2": r2_tr_s, "RMSE": rmse_tr_s, "RPD": rpd_tr_s
                 })
-
-                meta_global.fit(Z_tr_oof, y_tr)
                 y_te_stack = MetricsUtil.ravel_pred(meta_global.predict(Z_te))
                 r2_te_s, rmse_te_s, rpd_te_s = MetricsUtil.compute_metrics(y_te, y_te_stack)
                 fold_perf_records.append({
@@ -258,9 +270,10 @@ class NestedCVOrchestrator:
                     "Set": "Test", "R2": r2_te_s, "RMSE": rmse_te_s, "RPD": rpd_te_s
                 })
                 oof_pred_global[metal][te_idx] = y_te_stack
+                oof_pred_by_model[metal]["GlobalStack"][te_idx] = y_te_stack
 
                 # Zone Experts
-                zone_tr_oof_preds, zone_te_preds, zone_r2_train = [], [], []
+                zone_tr_oof_preds, zone_tr_self_preds, zone_te_preds, zone_r2_train = [], [], [], []
                 for zi, feat_idx in enumerate(zone_feature_indices):
                     X_tr_zone_int, X_te_zone_int = X_tr_sel[:, feat_idx], X_te_sel[:, feat_idx]
                     waves_zone = waves_float[feat_idx]
@@ -319,10 +332,18 @@ class NestedCVOrchestrator:
                         ModelTrainer.cross_val_predict_safe(best_krr_z, X_tr_zone, y_tr, cv=inner_meta_cv),
                         ModelTrainer.cross_val_predict_safe(best_en_z, X_tr_zone, y_tr, cv=inner_meta_cv)
                     ])
+                    pls_z_full = clone(best_pls_z).fit(X_tr_zone, y_tr)
+                    krr_z_full = clone(best_krr_z).fit(X_tr_zone, y_tr)
+                    en_z_full = clone(best_en_z).fit(X_tr_zone, y_tr)
+                    Zz_tr_self = np.column_stack([
+                        MetricsUtil.ravel_pred(pls_z_full.predict(X_tr_zone)),
+                        MetricsUtil.ravel_pred(krr_z_full.predict(X_tr_zone)),
+                        MetricsUtil.ravel_pred(en_z_full.predict(X_tr_zone))
+                    ])
                     Zz_te = np.column_stack([
-                        MetricsUtil.ravel_pred(clone(best_pls_z).fit(X_tr_zone, y_tr).predict(X_te_zone)),
-                        MetricsUtil.ravel_pred(clone(best_krr_z).fit(X_tr_zone, y_tr).predict(X_te_zone)),
-                        MetricsUtil.ravel_pred(clone(best_en_z).fit(X_tr_zone, y_tr).predict(X_te_zone))
+                        MetricsUtil.ravel_pred(pls_z_full.predict(X_te_zone)),
+                        MetricsUtil.ravel_pred(krr_z_full.predict(X_te_zone)),
+                        MetricsUtil.ravel_pred(en_z_full.predict(X_te_zone))
                     ])
 
                     meta_zone = MetaModelFactory.build_meta()
@@ -331,6 +352,7 @@ class NestedCVOrchestrator:
                     )
                     meta_zone.fit(Zz_tr, y_tr)
                     zone_tr_oof_preds.append(y_tr_z_oof)
+                    zone_tr_self_preds.append(MetricsUtil.ravel_pred(meta_zone.predict(Zz_tr_self)))
                     zone_te_preds.append(MetricsUtil.ravel_pred(meta_zone.predict(Zz_te)))
                     zone_r2_train.append(r2_score(y_tr, y_tr_z_oof))
 
@@ -356,18 +378,20 @@ class NestedCVOrchestrator:
                     np.column_stack([zone_te_preds[i] for i in keep_idx] + [y_te_stack])
                     if keep_idx else y_te_stack.reshape(-1, 1)
                 )
+                Z_moe_tr_self = (
+                    np.column_stack([zone_tr_self_preds[i] for i in keep_idx] + [y_tr_stack_self])
+                    if keep_idx else y_tr_stack_self.reshape(-1, 1)
+                )
 
                 moe_meta = MetaModelFactory.build_meta()
-                y_tr_moe_oof = ModelTrainer.cross_val_predict_safe(
-                    moe_meta, Z_moe_tr, y_tr, cv=inner_meta_cv
-                )
-                r2_tr_m, rmse_tr_m, rpd_tr_m = MetricsUtil.compute_metrics(y_tr, y_tr_moe_oof)
+                moe_meta.fit(Z_moe_tr, y_tr)
+                y_tr_moe_self = MetricsUtil.ravel_pred(moe_meta.predict(Z_moe_tr_self))
+                r2_tr_m, rmse_tr_m, rpd_tr_m = MetricsUtil.compute_metrics(y_tr, y_tr_moe_self)
                 fold_perf_records.append({
                     "Fold": outer_id, "Target": metal, "Model": "MoE",
                     "Set": "Train", "R2": r2_tr_m, "RMSE": rmse_tr_m, "RPD": rpd_tr_m
                 })
 
-                moe_meta.fit(Z_moe_tr, y_tr)
                 y_te_moe = MetricsUtil.ravel_pred(moe_meta.predict(Z_moe_te))
                 r2_te_m, rmse_te_m, rpd_te_m = MetricsUtil.compute_metrics(y_te, y_te_moe)
                 fold_perf_records.append({
@@ -376,9 +400,15 @@ class NestedCVOrchestrator:
                 })
 
                 oof_pred_moe[metal][te_idx] = y_te_moe
+                oof_pred_by_model[metal]["MoE"][te_idx] = y_te_moe
 
         fold_metrics_df = pd.DataFrame(fold_perf_records)
-        summary_df = ResultReporter.build_summary_table(fold_metrics_df)
+        summary_df = ResultReporter.build_summary_table(
+            fold_metrics_df,
+            Y_true_matrix=Y,
+            target_metals=self.target_metals,
+            oof_predictions_by_model=oof_pred_by_model
+        )
 
         if self.export_outputs and self.output_path:
             ResultReporter.export_oof_predictions_to_excel(
@@ -389,10 +419,12 @@ class NestedCVOrchestrator:
                 Y,
                 oof_pred_global,
                 oof_pred_moe,
-                fold_metrics_df
+                fold_metrics_df,
+                oof_predictions_by_model=oof_pred_by_model
             )
 
         return {
             "fold_metrics": fold_metrics_df,
             "summary": summary_df,
+            "oof_predictions": oof_pred_by_model,
         }
