@@ -3,9 +3,7 @@ import gc
 import sys
 import argparse
 import subprocess
-import shutil
 import warnings
-import tempfile
 
 import pandas as pd
 from sklearn.exceptions import ConvergenceWarning
@@ -68,6 +66,68 @@ def build_single_output_path(current_dir, metal, shared_max_features):
 
 def build_sweep_output_path(current_dir, metal):
     return os.path.abspath(os.path.join(current_dir, f"shared_max_features_sweep_{metal}.xlsx"))
+
+
+def sanitize_path_part(text):
+    return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in str(text))
+
+
+def build_sweep_checkpoint_dir(current_dir, metal, summary_model):
+    safe_model = sanitize_path_part(summary_model)
+    return os.path.abspath(os.path.join(current_dir, f"sweep_checkpoints_{metal}_{safe_model}"))
+
+
+def read_sweep_summary_xlsx(path, target_metal=None, summary_model=None):
+    try:
+        df = pd.read_excel(path)
+    except Exception as exc:
+        Logger.log(f"[WARN] Skip unreadable sweep checkpoint: {path} | {exc}")
+        return pd.DataFrame()
+
+    if "SHARED_MAX_FEATURES" not in df.columns:
+        Logger.log(f"[WARN] Skip sweep checkpoint without SHARED_MAX_FEATURES: {path}")
+        return pd.DataFrame()
+
+    if target_metal is not None and "Metal" in df.columns:
+        df = df[df["Metal"] == target_metal]
+    if summary_model is not None and "Model" in df.columns:
+        df = df[df["Model"] == summary_model]
+    return df
+
+
+def merge_sweep_summaries(frames):
+    valid_frames = [df for df in frames if df is not None and not df.empty]
+    if not valid_frames:
+        return pd.DataFrame()
+
+    merged = pd.concat(valid_frames, ignore_index=True)
+    merged = merged.dropna(subset=["SHARED_MAX_FEATURES"]).copy()
+    merged["SHARED_MAX_FEATURES"] = merged["SHARED_MAX_FEATURES"].astype(int)
+    return (
+        merged
+        .drop_duplicates(subset=["SHARED_MAX_FEATURES"], keep="last")
+        .sort_values("SHARED_MAX_FEATURES")
+        .reset_index(drop=True)
+    )
+
+
+def load_existing_sweep_results(sweep_output, checkpoint_dir, target_metal, summary_model):
+    frames = []
+    if os.path.exists(sweep_output):
+        frames.append(read_sweep_summary_xlsx(sweep_output, target_metal, summary_model))
+
+    if os.path.isdir(checkpoint_dir):
+        for name in sorted(os.listdir(checkpoint_dir)):
+            if name.lower().endswith(".xlsx"):
+                frames.append(
+                    read_sweep_summary_xlsx(
+                        os.path.join(checkpoint_dir, name),
+                        target_metal,
+                        summary_model
+                    )
+                )
+
+    return merge_sweep_summaries(frames)
 
 
 def collect_target_metrics(result, target_metal, summary_model, shared_max_features):
@@ -197,61 +257,103 @@ def run_sweep_jobs(current_dir, data_path, args):
             Config.SHARED_MAX_FEATURES_SWEEP_STEP
         )
     )
-    gpu_ids = parse_int_csv(args.gpu_ids)
-    chunks = split_contiguous(sweep_values, len(gpu_ids))
-    temp_dir = tempfile.mkdtemp(prefix=f"sweep_{args.metal.lower()}_", dir=current_dir)
-    try:
-        worker_jobs = []
-        for worker_id, (gpu_id, chunk) in enumerate(zip(gpu_ids, chunks), start=1):
-            if not chunk:
-                continue
-            summary_xlsx = os.path.join(temp_dir, f"worker_{worker_id:02d}_gpu_{gpu_id}.xlsx")
-            cmd = [
-                sys.executable,
-                os.path.abspath(__file__),
-                "--metal", args.metal,
-                "--worker-max-features", ",".join(str(x) for x in chunk),
-                "--summary-xlsx", summary_xlsx,
-                "--summary-model", args.summary_model,
-                "--n-jobs", str(args.worker_n_jobs),
-                "--no-oof-export",
-            ]
+    sweep_output = (
+        os.path.abspath(args.sweep_output)
+        if args.sweep_output else build_sweep_output_path(current_dir, args.metal)
+    )
+    checkpoint_dir = build_sweep_checkpoint_dir(current_dir, args.metal, args.summary_model)
+    os.makedirs(checkpoint_dir, exist_ok=True)
 
-            env = os.environ.copy()
-            env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-            env.setdefault("OMP_NUM_THREADS", "1")
-            env.setdefault("MKL_NUM_THREADS", "1")
-            env.setdefault("NUMEXPR_NUM_THREADS", "1")
+    target_metal = METAL_COLUMN_MAP[args.metal]
+    existing_df = load_existing_sweep_results(
+        sweep_output=sweep_output,
+        checkpoint_dir=checkpoint_dir,
+        target_metal=target_metal,
+        summary_model=args.summary_model
+    )
+    completed_values = (
+        set(existing_df["SHARED_MAX_FEATURES"].astype(int).tolist())
+        if not existing_df.empty else set()
+    )
+    pending_values = [x for x in sweep_values if x not in completed_values]
 
-            Logger.log(f"[*] Launch worker {worker_id}: GPU {gpu_id} -> features {chunk[0]}..{chunk[-1]}")
-            proc = subprocess.Popen(cmd, cwd=current_dir, env=env)
-            worker_jobs.append((gpu_id, chunk, summary_xlsx, proc))
-
-        failed = []
-        for gpu_id, chunk, _, proc in worker_jobs:
-            return_code = proc.wait()
-            if return_code != 0:
-                failed.append((gpu_id, chunk, return_code))
-
-        if failed:
-            raise RuntimeError(f"Sweep workers failed: {failed}")
-
-        frames = []
-        for _, _, summary_xlsx, _ in worker_jobs:
-            if not os.path.exists(summary_xlsx):
-                raise FileNotFoundError(f"Expected worker summary file not found: {summary_xlsx}")
-            frames.append(pd.read_excel(summary_xlsx))
-
-        sweep_df = pd.concat(frames, ignore_index=True).sort_values("SHARED_MAX_FEATURES").reset_index(drop=True)
-        sweep_output = (
-            os.path.abspath(args.sweep_output)
-            if args.sweep_output else build_sweep_output_path(current_dir, args.metal)
+    Logger.log(
+        f"[*] Sweep resume scan: completed={len(completed_values)} "
+        f"pending={len(pending_values)} checkpoint_dir={checkpoint_dir}"
+    )
+    if not existing_df.empty:
+        ResultReporter.export_sweep_summary_to_excel(
+            sweep_output,
+            existing_df,
+            sheet_name=f"{args.metal}_Sweep"
         )
 
-        ResultReporter.export_sweep_summary_to_excel(sweep_output, sweep_df, sheet_name=f"{args.metal}_Sweep")
-        return sweep_df
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
+    if not pending_values:
+        Logger.log("[*] Sweep already complete. No pending SHARED_MAX_FEATURES values.")
+        return existing_df
+
+    gpu_ids = parse_int_csv(args.gpu_ids)
+    if not gpu_ids:
+        raise ValueError("--gpu-ids must contain at least one GPU id in sweep mode.")
+
+    chunks = split_contiguous(pending_values, len(gpu_ids))
+    run_id = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+    worker_jobs = []
+
+    for worker_id, (gpu_id, chunk) in enumerate(zip(gpu_ids, chunks), start=1):
+        if not chunk:
+            continue
+        summary_xlsx = os.path.join(
+            checkpoint_dir,
+            f"run_{run_id}_worker_{worker_id:02d}_gpu_{gpu_id}.xlsx"
+        )
+        cmd = [
+            sys.executable,
+            os.path.abspath(__file__),
+            "--metal", args.metal,
+            "--worker-max-features", ",".join(str(x) for x in chunk),
+            "--summary-xlsx", summary_xlsx,
+            "--summary-model", args.summary_model,
+            "--n-jobs", str(args.worker_n_jobs),
+            "--no-oof-export",
+        ]
+
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        env.setdefault("OMP_NUM_THREADS", "1")
+        env.setdefault("MKL_NUM_THREADS", "1")
+        env.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+        Logger.log(
+            f"[*] Launch worker {worker_id}: GPU {gpu_id} "
+            f"-> pending features {chunk[0]}..{chunk[-1]} ({len(chunk)} tasks)"
+        )
+        proc = subprocess.Popen(cmd, cwd=current_dir, env=env)
+        worker_jobs.append((gpu_id, chunk, summary_xlsx, proc))
+
+    failed = []
+    for gpu_id, chunk, _, proc in worker_jobs:
+        return_code = proc.wait()
+        if return_code != 0:
+            failed.append((gpu_id, chunk, return_code))
+
+    frames = [existing_df]
+    for _, _, summary_xlsx, _ in worker_jobs:
+        if os.path.exists(summary_xlsx):
+            frames.append(read_sweep_summary_xlsx(summary_xlsx, target_metal, args.summary_model))
+        elif not failed:
+            raise FileNotFoundError(f"Expected worker summary file not found: {summary_xlsx}")
+
+    sweep_df = merge_sweep_summaries(frames)
+    ResultReporter.export_sweep_summary_to_excel(sweep_output, sweep_df, sheet_name=f"{args.metal}_Sweep")
+
+    if failed:
+        raise RuntimeError(
+            f"Sweep workers failed: {failed}. Partial results were saved to: {sweep_output}"
+        )
+
+    Logger.log(f"[*] Sweep complete: {len(sweep_df)}/{len(sweep_values)} feature counts saved.")
+    return sweep_df
 
 
 if __name__ == "__main__":
