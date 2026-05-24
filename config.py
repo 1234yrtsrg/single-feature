@@ -13,8 +13,8 @@ class Config:
     SHARED_MAX_FEATURES_SWEEP_STEP = 1
     
     # physical partition (400-1800 nm)
-    PHYSICAL_ZONE_EDGES = [400, 700, 1100, 1400, 1800]
-    PHYSICAL_ZONE_NAMES = ["VIS(400-700)", "NIR1(700-1100)", "SWIR1(1100-1400)", "SWIR2(1400-1800)"]
+    PHYSICAL_ZONE_EDGES = [400, 900, 1400, 1800]
+    PHYSICAL_ZONE_NAMES = ["LFR(400-900)", "MFR(900-1400)", "HFR(1400-1800)"]
     
     # MoE zone filtering threshold
     MOE_ZONE_R2_THRESHOLD = 0.8
